@@ -75,6 +75,7 @@ $ErrorActionPreference = 'Stop'
 
 $NvGSyncSource = @'
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 
 namespace Genlocker
@@ -129,6 +130,14 @@ namespace Genlocker
         public bool[] Rj45Ethernet = new bool[2];
     }
 
+    public class DisplayRefresh
+    {
+        public string GdiName;
+        public uint DisplayId;  // NVAPI display id, 0 if it couldn't be mapped
+        public double Hz;
+        public bool Interlaced;
+    }
+
     public class ControlParams
     {
         public int Polarity, VideoMode, Source, MultiplyDivideMode;
@@ -151,6 +160,7 @@ namespace Genlocker
         const uint ID_GetDriverAndBranchVersion = 0x2926AAAD;
         const uint ID_GPU_GetFullName = 0xCEEE8E9F;
         const uint ID_GetPhysicalGpuFromDisplayId = 0x9EA74659;
+        const uint ID_GetDisplayIdByDisplayName = 0xAE457190;
         const uint ID_GSync_EnumSyncDevices = 0xD9639601;
         const uint ID_GSync_QueryCapabilities = 0x44A3F1D1;
         const uint ID_GSync_GetTopology = 0x4562BC38;
@@ -176,6 +186,7 @@ namespace Genlocker
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int FnErrorMessage(int status, IntPtr msg);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int FnGpuFromDisplay(uint displayId, out IntPtr gpu);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int FnDriverVersion(out uint version, IntPtr branch);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int FnDisplayIdByName([MarshalAs(UnmanagedType.LPStr)] string name, out uint displayId);
 
         static T Fn<T>(uint id) where T : class
         {
@@ -278,6 +289,23 @@ namespace Genlocker
             }
             catch (NvApiException) { }
             return IntPtr.Zero;
+        }
+
+        // gdiName as Windows reports it, e.g. \\.\DISPLAY1. Returns 0 if NVAPI doesn't know it.
+        public static uint DisplayIdFromName(string gdiName)
+        {
+            string[] candidates = { gdiName, gdiName.Replace(@"\\.\", @"\") };
+            foreach (string name in candidates)
+            {
+                try
+                {
+                    uint id;
+                    if (Fn<FnDisplayIdByName>(ID_GetDisplayIdByDisplayName)(name, out id) == 0 && id != 0)
+                        return id;
+                }
+                catch (NvApiException) { }
+            }
+            return 0;
         }
 
         public static IntPtr[] EnumSyncDevices()
@@ -479,6 +507,88 @@ namespace Genlocker
             finally { Marshal.FreeHGlobal(buf); }
         }
     }
+
+    // Current refresh rates from Windows (QueryDisplayConfig). The Sync card reports its own
+    // refresh rate as 0 until it locks, so this is the only way to see a mismatch up front.
+    public static class WinDisplays
+    {
+        const uint QDC_ONLY_ACTIVE_PATHS = 2;
+        const int ERROR_INSUFFICIENT_BUFFER = 122;
+        const int PATH_SIZE = 72;         // DISPLAYCONFIG_PATH_INFO
+        const int MODE_SIZE = 64;         // DISPLAYCONFIG_MODE_INFO
+        const int SOURCE_NAME_SIZE = 84;  // DISPLAYCONFIG_SOURCE_DEVICE_NAME
+
+        [DllImport("user32.dll")] static extern int GetDisplayConfigBufferSizes(uint flags, out uint numPaths, out uint numModes);
+        [DllImport("user32.dll")] static extern int QueryDisplayConfig(uint flags, ref uint numPaths, IntPtr paths, ref uint numModes, IntPtr modes, IntPtr topologyId);
+        [DllImport("user32.dll")] static extern int DisplayConfigGetDeviceInfo(IntPtr request);
+
+        static uint U32(IntPtr p, int off) { return unchecked((uint)Marshal.ReadInt32(p, off)); }
+
+        static string SourceName(IntPtr paths, int p)
+        {
+            IntPtr req = Marshal.AllocHGlobal(SOURCE_NAME_SIZE);
+            try
+            {
+                Marshal.Copy(new byte[SOURCE_NAME_SIZE], 0, req, SOURCE_NAME_SIZE);
+                Marshal.WriteInt32(req, 0, 1);                                  // DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME
+                Marshal.WriteInt32(req, 4, SOURCE_NAME_SIZE);
+                Marshal.WriteInt64(req, 8, Marshal.ReadInt64(paths, p));        // sourceInfo.adapterId
+                Marshal.WriteInt32(req, 16, Marshal.ReadInt32(paths, p + 8));   // sourceInfo.id
+                if (DisplayConfigGetDeviceInfo(req) != 0) return null;
+                return Marshal.PtrToStringUni(new IntPtr(req.ToInt64() + 20));
+            }
+            finally { Marshal.FreeHGlobal(req); }
+        }
+
+        public static DisplayRefresh[] GetActive()
+        {
+            List<DisplayRefresh> list = new List<DisplayRefresh>();
+            IntPtr paths = IntPtr.Zero, modes = IntPtr.Zero;
+            try
+            {
+                uint np = 0, nm = 0;
+                int err = ERROR_INSUFFICIENT_BUFFER;
+                // The topology can change between the two calls; retry if the buffers came out too small.
+                for (int tries = 0; tries < 3 && err == ERROR_INSUFFICIENT_BUFFER; tries++)
+                {
+                    if (paths != IntPtr.Zero) { Marshal.FreeHGlobal(paths); paths = IntPtr.Zero; }
+                    if (modes != IntPtr.Zero) { Marshal.FreeHGlobal(modes); modes = IntPtr.Zero; }
+                    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, out np, out nm) != 0) return list.ToArray();
+                    paths = Marshal.AllocHGlobal(Math.Max((int)np, 1) * PATH_SIZE);
+                    modes = Marshal.AllocHGlobal(Math.Max((int)nm, 1) * MODE_SIZE);
+                    err = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, ref np, paths, ref nm, modes, IntPtr.Zero);
+                }
+                if (err != 0) return list.ToArray();
+
+                for (int i = 0; i < np; i++)
+                {
+                    int p = i * PATH_SIZE;
+                    uint num = U32(paths, p + 48), den = U32(paths, p + 52);   // targetInfo.refreshRate
+                    uint scan = U32(paths, p + 56);                            // targetInfo.scanLineOrdering
+                    uint modeIdx = U32(paths, p + 32);                         // targetInfo.modeInfoIdx
+                    if ((num == 0 || den == 0) && modeIdx < nm && U32(modes, (int)modeIdx * MODE_SIZE) == 2)
+                    {
+                        num = U32(modes, (int)modeIdx * MODE_SIZE + 32);       // targetVideoSignalInfo.vSyncFreq
+                        den = U32(modes, (int)modeIdx * MODE_SIZE + 36);
+                    }
+                    if (num == 0 || den == 0) continue;
+
+                    DisplayRefresh d = new DisplayRefresh();
+                    d.Hz = (double)num / den;
+                    d.Interlaced = scan == 2 || scan == 3;
+                    d.GdiName = SourceName(paths, p);
+                    if (d.GdiName != null) d.DisplayId = NvGSync.DisplayIdFromName(d.GdiName);
+                    list.Add(d);
+                }
+                return list.ToArray();
+            }
+            finally
+            {
+                if (paths != IntPtr.Zero) Marshal.FreeHGlobal(paths);
+                if (modes != IntPtr.Zero) Marshal.FreeHGlobal(modes);
+            }
+        }
+    }
 }
 '@
 
@@ -561,6 +671,7 @@ function Get-ActiveDisplays($Snapshot) {
 function Format-DisplayId([uint32]$Id) { '0x{0:X8}' -f $Id }
 
 function Write-SyncStatus($Snapshot) {
+    $rates = Get-DisplayRefreshMap
     foreach ($dev in $Snapshot) {
         $c = $dev.Control; $s = $dev.Status; $caps = $dev.Caps
         Write-Log ('Sync device {0}: board P{1:X} FPGA rev {2}.{3}' -f $dev.Index, $caps.BoardId, $caps.Revision, $caps.ExtendedRevision)
@@ -570,7 +681,12 @@ function Write-SyncStatus($Snapshot) {
         else {
             Write-Log '  House sync (BNC): NOT DETECTED' Warn
         }
-        Write-Log ('  Display refresh: ~{0} Hz (raw {1})' -f (Get-Rate $s.RefreshRate).Hz, $s.RefreshRate)
+        if ($s.RefreshRate -gt 0) {
+            Write-Log ('  Sync card refresh: ~{0} Hz (raw {1})' -f (Get-Rate $s.RefreshRate).Hz, $s.RefreshRate)
+        }
+        else {
+            Write-Log '  Sync card refresh: not reported (normal until locked)'
+        }
         Write-Log ('  Sync source: {0} | signal type: {1} | polarity: {2} | interval: {3}{4}' -f `
             $(if ($c.Source -eq 1) { 'HOUSE SYNC' } else { 'VSync (internal/display)' }),
             $VideoModeNames[$c.VideoMode], $PolarityNames[$c.Polarity], $c.Interval,
@@ -582,7 +698,9 @@ function Write-SyncStatus($Snapshot) {
         }
         foreach ($d in $dev.Displays) {
             $gpu = $dev.Gpus | Where-Object { $_.Info.Handle -eq $d.Gpu } | Select-Object -First 1
-            Write-Log ('  Display {0}: {1}{2}{3}{4}' -f (Format-DisplayId $d.DisplayId), $SyncStateNames[$d.SyncState],
+            $r = $rates[$d.DisplayId]
+            Write-Log ('  Display {0}: {1}{2}{3}{4}{5}' -f (Format-DisplayId $d.DisplayId), $SyncStateNames[$d.SyncState],
+                $(if ($r) { ' @ {0:0.###} Hz{1}' -f $r.Hz, $(if ($r.Interlaced) { ' interlaced' } else { '' }) } else { '' }),
                 $(if ($d.Masterable) { ', server-capable' } else { '' }),
                 $(if ($gpu) { ", on $($gpu.Info.Name)" } else { '' }),
                 $(if ($script:Excluded -contains $d.DisplayId) { ' (excluded)' } else { '' }))
@@ -660,17 +778,51 @@ function Set-HouseSyncSource([IntPtr]$Handle) {
     [Genlocker.NvGSync]::SetControl($Handle, $c)
 }
 
+# NVAPI display id -> Windows refresh info, for the displays NVAPI could map.
+function Get-DisplayRefreshMap {
+    $map = @{}
+    try {
+        foreach ($r in [Genlocker.WinDisplays]::GetActive()) {
+            if ($r.DisplayId -ne 0) { $map[$r.DisplayId] = $r }
+        }
+    }
+    catch { }
+    $map
+}
+
 # Returns a description of the mismatch, or $null when the rates match or can't be compared
-# (no signal, rate not reported, or the card is multiplying/dividing house sync).
+# (no signal, rate unknown, or the card is multiplying/dividing house sync).
 function Get-RateMismatch($Device) {
     if (-not $Device -or -not $Device.Status.HouseSync -or $Device.Control.MultiplyDivideMode -ne 0) { return $null }
     $house = Get-Rate $Device.Status.HouseSyncIncoming
-    $refresh = Get-Rate $Device.Status.RefreshRate
-    if ($house.Hz -le 0 -or $refresh.Hz -le 0) { return $null }
-    # A difference smaller than the coarser value's resolution may just be rounding (e.g. 59.94 reported as 60).
-    $tolerance = [Math]::Max([Math]::Max($house.Resolution, $refresh.Resolution), 0.02)
-    if ([Math]::Abs($house.Hz - $refresh.Hz) -lt $tolerance) { return $null }
-    "house sync on BNC is ~$($house.Hz) Hz but the displays are running at ~$($refresh.Hz) Hz"
+    if ($house.Hz -le 0) { return $null }
+
+    # Prefer the exact per-display rates from Windows; the card's own figure is 0 until it locks.
+    $outputs = New-Object System.Collections.Generic.List[object]
+    $map = Get-DisplayRefreshMap
+    foreach ($d in $Device.Displays) {
+        if ($script:Excluded -contains $d.DisplayId) { continue }
+        $r = $map[$d.DisplayId]
+        if ($r) {
+            $outputs.Add([pscustomobject]@{ Name = "display $(Format-DisplayId $d.DisplayId)"; Hz = $r.Hz; Resolution = 0.001; Interlaced = $r.Interlaced })
+        }
+    }
+    if ($outputs.Count -eq 0) {
+        $refresh = Get-Rate $Device.Status.RefreshRate
+        if ($refresh.Hz -le 0) { return $null }
+        $outputs.Add([pscustomobject]@{ Name = 'the output'; Hz = $refresh.Hz; Resolution = $refresh.Resolution; Interlaced = $false })
+    }
+
+    $bad = @(foreach ($o in $outputs) {
+            # A difference smaller than the coarser value's resolution may just be rounding (e.g. 59.94 reported as 60).
+            $tolerance = [Math]::Max([Math]::Max($house.Resolution, $o.Resolution), 0.02)
+            # Interlaced modes may be reported as frame or field rate.
+            $candidates = if ($o.Interlaced) { @($o.Hz, ($o.Hz * 2), ($o.Hz / 2)) } else { @($o.Hz) }
+            if (-not ($candidates | Where-Object { [Math]::Abs($house.Hz - $_) -lt $tolerance })) { $o }
+        })
+    if ($bad.Count -eq 0) { return $null }
+    $desc = ($bad | ForEach-Object { '{0} runs at {1:0.###} Hz' -f $_.Name, $_.Hz }) -join ', '
+    "house sync on BNC is $($house.Hz) Hz but $desc"
 }
 
 function Get-HouseSyncDevice($Snapshot) {
@@ -749,7 +901,7 @@ function Invoke-LockAttempt([int]$Attempt) {
     Write-Log "Server display $(Format-DisplayId $master.Display.DisplayId) on Sync device $($mdev.Index); $($plan.Active.Count - 1) client display(s)"
     if (-not $mdev.Status.HouseSync) { Write-Log "Sync device $($mdev.Index) has no house sync signal but the server display is on it" Warn }
     $mismatch = Get-RateMismatch $mdev
-    if ($mismatch) { Write-Log "Possible rate mismatch: $mismatch - trying once to confirm" Warn }
+    if ($mismatch) { Write-Log "Rate mismatch: $mismatch - trying anyway" Warn }
 
     # Each retry gives the hardware a little longer to settle.
     $settleMs = [Math]::Min(1000 + 500 * ($Attempt - 1), 5000)
@@ -793,6 +945,15 @@ function Invoke-LockLoop([bool]$CheckExisting, [int]$Max) {
         }
     }
     for ($n = 1; $Max -le 0 -or $n -le $Max; $n++) {
+        # No amount of retrying locks a mismatched rate, so stop before trying.
+        if (-not $IgnoreRateMismatch) {
+            $mismatch = $null
+            try { $mismatch = Get-RateMismatch (Get-HouseSyncDevice (Get-SyncSnapshot)) } catch { }
+            if ($mismatch) {
+                Write-RateMismatchHelp $mismatch
+                return 'RateMismatch'
+            }
+        }
         Write-Log ('--- Attempt {0}{1} ---' -f $n, $(if ($Max -gt 0) { " of $Max" } else { '' }))
         try {
             if (Invoke-LockAttempt $n) {
@@ -802,16 +963,6 @@ function Invoke-LockLoop([bool]$CheckExisting, [int]$Max) {
         }
         catch {
             Write-Log "Attempt $n failed: $($_.Exception.Message)" Error
-        }
-        # The rate is only treated as the cause once a real attempt has failed, so a misread
-        # rate can never stop a setup that would have locked.
-        if (-not $IgnoreRateMismatch) {
-            $mismatch = $null
-            try { $mismatch = Get-RateMismatch (Get-HouseSyncDevice (Get-SyncSnapshot)) } catch { }
-            if ($mismatch) {
-                Write-RateMismatchHelp $mismatch
-                return 'RateMismatch'
-            }
         }
         if ($Max -le 0 -or $n -lt $Max) {
             $backoff = [Math]::Min(2 * $n, 10)
@@ -845,7 +996,7 @@ catch {
     exit 2
 }
 
-if (-not ('Genlocker.NvGSync' -as [type])) { Add-Type -TypeDefinition $NvGSyncSource -Language CSharp }
+if (-not ('Genlocker.WinDisplays' -as [type])) { Add-Type -TypeDefinition $NvGSyncSource -Language CSharp }
 
 try {
     [Genlocker.NvGSync]::Initialize()

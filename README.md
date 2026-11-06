@@ -36,10 +36,10 @@ with `-ExecutionPolicy Bypass`.
 6. Polls every 250 ms until every GPU in the group reports *synced*. The lock then has to stay good
    for `-HoldSeconds`. Any drop during that window counts as a failed attempt.
 
-Failed attempts are retried with a growing back-off of 2 s, 4 s and so on, up to 10 s. Retrying
-is skipped when it can't help: if an attempt fails while the house sync rate and the display
-refresh rate differ, Genlocker reports a **rate mismatch** and stops with exit code 4. In Watch
-mode it waits until the rates match, then carries on. The settle
+Failed attempts are retried with a growing back-off of 2 s, 4 s and so on, up to 10 s. Before each
+attempt, Genlocker compares the house sync rate with each display's refresh rate as Windows
+reports it. If they differ, retrying can't help, so it reports a **rate mismatch** and stops
+with exit code 4. In Watch mode it waits until the rates match, then carries on. The settle
 time after releasing the group also grows on each attempt. If the card is already locked when
 Genlocker starts, it only confirms the hold and changes nothing. Pass `-Force` to reconfigure
 anyway.
@@ -77,10 +77,12 @@ schtasks /Create /TN Genlocker /RL HIGHEST /SC ONLOGON /DELAY 0000:30 ^
 
 - **The rates must match.** The display timing has to match the house reference, for example 50 Hz
   output for a 50 Hz / 625i reference or 59.94 Hz for NTSC. Otherwise no amount of retrying will
-  hold a lock. Genlocker prints both rates. If an attempt fails while they differ, it stops with a
-  `RATE MISMATCH` error (exit code 4) instead of retrying. It only stops after a failed attempt, so
-  a misread rate can't block a setup that would lock. Differences smaller than the reported
-  precision are treated as a match, so 59.94 Hz reported as `60` doesn't trigger it.
+  hold a lock. Genlocker shows the house sync rate and each display's refresh rate. When they
+  differ, it stops straight away with a `RATE MISMATCH` error (exit code 4) instead of retrying.
+  Display rates come from Windows, because the Sync card reports its own refresh as 0 until it
+  locks. Windows reports them exactly, so 59.94 against 60 is caught. Interlaced modes match at
+  either the field or the frame rate. If the check ever gets it wrong, `-IgnoreRateMismatch`
+  turns it off.
 - **`House sync: NOT DETECTED`.** Check the cable, the 75 Ω termination and the signal type. Try
   `-SignalType BiLevel` or `-SignalType TriLevel` explicitly.
 - **Every display on a synced GPU must use identical timing.** Exclude any GUI monitor that runs a
@@ -96,5 +98,6 @@ schtasks /Create /TN Genlocker /RL HIGHEST /SC ONLOGON /DELAY 0000:30 ^
 - 64-bit Windows only. Struct layouts and function IDs come from the public
   [NVAPI SDK](https://github.com/NVIDIA/nvapi) (MIT licensed). Genlocker falls back to older struct
   versions automatically on older drivers.
-- NVAPI doesn't document the units of the refresh / house sync rate fields. Genlocker prints the raw
-  values next to its Hz estimate.
+- NVAPI doesn't document the units of the refresh / house sync rate fields. On a P2061 with
+  driver 582.53, the house sync rate is reported in units of 1/10,000 Hz (raw `500000` = 50 Hz).
+  Genlocker prints the raw values next to its Hz estimate.
