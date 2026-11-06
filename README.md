@@ -36,7 +36,10 @@ with `-ExecutionPolicy Bypass`.
 6. Polls every 250 ms until every GPU in the group reports *synced*. The lock then has to stay good
    for `-HoldSeconds`. Any drop during that window counts as a failed attempt.
 
-Failed attempts are retried with a growing back-off of 2 s, 4 s and so on, up to 10 s. The settle
+Failed attempts are retried with a growing back-off of 2 s, 4 s and so on, up to 10 s. Retrying
+is skipped when it can't help: if an attempt fails while the house sync rate and the display
+refresh rate differ, Genlocker reports a **rate mismatch** and stops with exit code 4. In Watch
+mode it waits until the rates match, then carries on. The settle
 time after releasing the group also grows on each attempt. If the card is already locked when
 Genlocker starts, it only confirms the hold and changes nothing. Pass `-Force` to reconfigure
 anyway.
@@ -54,6 +57,7 @@ anyway.
 | `-ExcludeDisplayId` | none | Displays to leave out of the group, such as a GUI monitor |
 | `-Force` | off | Reconfigure even if the card is already locked |
 | `-LossGraceSeconds` | 2 | Watch mode: how long a lost lock is tolerated before Genlocker re-locks |
+| `-IgnoreRateMismatch` | off | Keep retrying even when the rates don't match |
 | `-LogFile` | none | Also append the log to this file |
 
 If you don't pass `-MasterDisplayId`, Genlocker keeps the current server display if it's on the card
@@ -73,7 +77,10 @@ schtasks /Create /TN Genlocker /RL HIGHEST /SC ONLOGON /DELAY 0000:30 ^
 
 - **The rates must match.** The display timing has to match the house reference, for example 50 Hz
   output for a 50 Hz / 625i reference or 59.94 Hz for NTSC. Otherwise no amount of retrying will
-  hold a lock. Genlocker prints both rates and warns when they differ.
+  hold a lock. Genlocker prints both rates. If an attempt fails while they differ, it stops with a
+  `RATE MISMATCH` error (exit code 4) instead of retrying. It only stops after a failed attempt, so
+  a misread rate can't block a setup that would lock. Differences smaller than the reported
+  precision are treated as a match, so 59.94 Hz reported as `60` doesn't trigger it.
 - **`House sync: NOT DETECTED`.** Check the cable, the 75 Ω termination and the signal type. Try
   `-SignalType BiLevel` or `-SignalType TriLevel` explicitly.
 - **Every display on a synced GPU must use identical timing.** Exclude any GUI monitor that runs a
@@ -82,7 +89,7 @@ schtasks /Create /TN Genlocker /RL HIGHEST /SC ONLOGON /DELAY 0000:30 ^
 
 ## Exit codes
 
-`0` locked · `1` not locked / gave up · `2` no Sync device or an NVAPI error · `3` not running as Administrator
+`0` locked · `1` not locked / gave up · `2` no Sync device or an NVAPI error · `3` not running as Administrator · `4` stopped: house sync and display refresh rates don't match
 
 ## Notes
 

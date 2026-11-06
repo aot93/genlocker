@@ -65,6 +65,9 @@ param(
 
     [int]$PollMilliseconds = 250,
 
+    # Keep retrying even when house sync and display refresh rates don't match.
+    [switch]$IgnoreRateMismatch,
+
     [string]$LogFile
 )
 
@@ -513,10 +516,12 @@ function ConvertTo-DisplayId([string]$Text) {
 }
 
 # NVAPI doesn't document the units of the rate fields; scale whatever we get into a plausible Hz range.
-function ConvertTo-Hz([double]$Raw) {
+# Resolution is the smallest step the raw value can express (1 Hz for a raw 60, 0.001 Hz for 59940).
+function Get-Rate([double]$Raw) {
     $v = $Raw
-    while ($v -gt 250) { $v /= 10 }
-    return [Math]::Round($v, 3)
+    $resolution = 1.0
+    while ($v -gt 250) { $v /= 10; $resolution /= 10 }
+    [pscustomobject]@{ Hz = [Math]::Round($v, 3); Resolution = $resolution }
 }
 
 function Get-SyncSnapshot {
@@ -560,12 +565,12 @@ function Write-SyncStatus($Snapshot) {
         $c = $dev.Control; $s = $dev.Status; $caps = $dev.Caps
         Write-Log ('Sync device {0}: board P{1:X} FPGA rev {2}.{3}' -f $dev.Index, $caps.BoardId, $caps.Revision, $caps.ExtendedRevision)
         if ($s.HouseSync) {
-            Write-Log ('  House sync (BNC): PRESENT, ~{0} Hz (raw {1})' -f (ConvertTo-Hz $s.HouseSyncIncoming), $s.HouseSyncIncoming) Good
+            Write-Log ('  House sync (BNC): PRESENT, ~{0} Hz (raw {1})' -f (Get-Rate $s.HouseSyncIncoming).Hz, $s.HouseSyncIncoming) Good
         }
         else {
             Write-Log '  House sync (BNC): NOT DETECTED' Warn
         }
-        Write-Log ('  Display refresh: ~{0} Hz (raw {1})' -f (ConvertTo-Hz $s.RefreshRate), $s.RefreshRate)
+        Write-Log ('  Display refresh: ~{0} Hz (raw {1})' -f (Get-Rate $s.RefreshRate).Hz, $s.RefreshRate)
         Write-Log ('  Sync source: {0} | signal type: {1} | polarity: {2} | interval: {3}{4}' -f `
             $(if ($c.Source -eq 1) { 'HOUSE SYNC' } else { 'VSync (internal/display)' }),
             $VideoModeNames[$c.VideoMode], $PolarityNames[$c.Polarity], $c.Interval,
@@ -655,11 +660,45 @@ function Set-HouseSyncSource([IntPtr]$Handle) {
     [Genlocker.NvGSync]::SetControl($Handle, $c)
 }
 
-function Test-RateMatch($Device) {
-    $house = ConvertTo-Hz $Device.Status.HouseSyncIncoming
-    $refresh = ConvertTo-Hz $Device.Status.RefreshRate
-    if ($house -gt 0 -and $refresh -gt 0 -and $Device.Control.MultiplyDivideMode -eq 0 -and [Math]::Abs($house - $refresh) -gt 0.5) {
-        Write-Log "House sync (~$house Hz) and display refresh (~$refresh Hz) look different - the lock cannot hold unless the output timing matches the reference." Warn
+# Returns a description of the mismatch, or $null when the rates match or can't be compared
+# (no signal, rate not reported, or the card is multiplying/dividing house sync).
+function Get-RateMismatch($Device) {
+    if (-not $Device -or -not $Device.Status.HouseSync -or $Device.Control.MultiplyDivideMode -ne 0) { return $null }
+    $house = Get-Rate $Device.Status.HouseSyncIncoming
+    $refresh = Get-Rate $Device.Status.RefreshRate
+    if ($house.Hz -le 0 -or $refresh.Hz -le 0) { return $null }
+    # A difference smaller than the coarser value's resolution may just be rounding (e.g. 59.94 reported as 60).
+    $tolerance = [Math]::Max([Math]::Max($house.Resolution, $refresh.Resolution), 0.02)
+    if ([Math]::Abs($house.Hz - $refresh.Hz) -lt $tolerance) { return $null }
+    "house sync on BNC is ~$($house.Hz) Hz but the displays are running at ~$($refresh.Hz) Hz"
+}
+
+function Get-HouseSyncDevice($Snapshot) {
+    $Snapshot | Where-Object { $_.Status.HouseSync } | Select-Object -First 1
+}
+
+function Write-RateMismatchHelp([string]$Mismatch) {
+    Write-Log "RATE MISMATCH: $Mismatch." Error
+    Write-Log 'The Sync card cannot lock until the display refresh rate matches the house sync reference.' Error
+    Write-Log 'Set the output timing to the reference rate (e.g. 50 Hz for a 625/50 reference, 59.94 Hz for 525/59.94),' Error
+    Write-Log 'or change the reference to the output rate, then run Genlocker again.' Error
+}
+
+# Watch mode: after a mismatch, wait for someone to fix the rates rather than hammering re-lock attempts.
+function Wait-RatesMatch {
+    Write-Log 'Waiting for the rates to match before trying again'
+    while ($true) {
+        Start-Sleep -Seconds 2
+        try {
+            $snap = Get-SyncSnapshot
+            if (-not (Get-RateMismatch (Get-HouseSyncDevice $snap))) {
+                Write-Log 'Rates now match (or house sync changed) - retrying' Good
+                return
+            }
+        }
+        catch {
+            Write-Log "Monitor error: $($_.Exception.Message)" Error
+        }
     }
 }
 
@@ -709,7 +748,8 @@ function Invoke-LockAttempt([int]$Attempt) {
     $mdev = $master.Device
     Write-Log "Server display $(Format-DisplayId $master.Display.DisplayId) on Sync device $($mdev.Index); $($plan.Active.Count - 1) client display(s)"
     if (-not $mdev.Status.HouseSync) { Write-Log "Sync device $($mdev.Index) has no house sync signal but the server display is on it" Warn }
-    Test-RateMatch $mdev
+    $mismatch = Get-RateMismatch $mdev
+    if ($mismatch) { Write-Log "Possible rate mismatch: $mismatch - trying once to confirm" Warn }
 
     # Each retry gives the hardware a little longer to settle.
     $settleMs = [Math]::Min(1000 + 500 * ($Attempt - 1), 5000)
@@ -737,6 +777,7 @@ function Invoke-LockAttempt([int]$Attempt) {
     return (Wait-LockHold $LockTimeoutSeconds)
 }
 
+# Returns 'Locked', 'Failed' (attempts used up) or 'RateMismatch' (retrying cannot help).
 function Invoke-LockLoop([bool]$CheckExisting, [int]$Max) {
     if ($CheckExisting) {
         $t = Test-Lock (Get-SyncSnapshot)
@@ -744,7 +785,7 @@ function Invoke-LockLoop([bool]$CheckExisting, [int]$Max) {
             Write-Log 'Already locked to house sync - confirming it holds'
             if (Wait-LockHold 0) {
                 Write-Log "Existing genlock held for ${HoldSeconds}s - nothing to do" Good
-                return $true
+                return 'Locked'
             }
         }
         else {
@@ -756,11 +797,21 @@ function Invoke-LockLoop([bool]$CheckExisting, [int]$Max) {
         try {
             if (Invoke-LockAttempt $n) {
                 Write-Log "GENLOCKED: lock to house sync held for ${HoldSeconds}s (attempt $n)" Good
-                return $true
+                return 'Locked'
             }
         }
         catch {
             Write-Log "Attempt $n failed: $($_.Exception.Message)" Error
+        }
+        # The rate is only treated as the cause once a real attempt has failed, so a misread
+        # rate can never stop a setup that would have locked.
+        if (-not $IgnoreRateMismatch) {
+            $mismatch = $null
+            try { $mismatch = Get-RateMismatch (Get-HouseSyncDevice (Get-SyncSnapshot)) } catch { }
+            if ($mismatch) {
+                Write-RateMismatchHelp $mismatch
+                return 'RateMismatch'
+            }
         }
         if ($Max -le 0 -or $n -lt $Max) {
             $backoff = [Math]::Min(2 * $n, 10)
@@ -769,7 +820,7 @@ function Invoke-LockLoop([bool]$CheckExisting, [int]$Max) {
         }
     }
     Write-Log "Could not establish a stable genlock after $Max attempts" Error
-    return $false
+    return 'Failed'
 }
 
 # ---------------------------------------------------------------------------
@@ -816,6 +867,8 @@ switch ($Action) {
         $t = Test-Lock $snap
         if ($t.Locked) { Write-Log 'LOCKED to house sync' Good; exit 0 }
         Write-Log "NOT locked: $($t.Reason)" Warn
+        $mismatch = Get-RateMismatch (Get-HouseSyncDevice $snap)
+        if ($mismatch) { Write-RateMismatchHelp $mismatch }
         exit 1
     }
     'Unlock' {
@@ -826,11 +879,21 @@ switch ($Action) {
 }
 
 $maxAttempts = if ($Action -eq 'Watch') { 0 } else { $MaxAttempts }
-$ok = Invoke-LockLoop -CheckExisting (-not $Force) -Max $maxAttempts
+$result = Invoke-LockLoop -CheckExisting (-not $Force) -Max $maxAttempts
 
 if ($Action -eq 'Lock') {
     try { Write-SyncStatus (Get-SyncSnapshot) } catch { }
-    if ($ok) { exit 0 } else { exit 1 }
+    switch ($result) {
+        'Locked' { exit 0 }
+        'RateMismatch' { exit 4 }
+        default { exit 1 }
+    }
+}
+
+# Watch: keep going until the lock is first established, waiting out any rate mismatch.
+while ($result -ne 'Locked') {
+    Wait-RatesMatch
+    $result = Invoke-LockLoop -CheckExisting $true -Max 0
 }
 
 Write-Log "Watching the lock (Ctrl+C to stop); re-locking if it stays lost for ${LossGraceSeconds}s"
@@ -848,7 +911,11 @@ while ($true) {
         }
         elseif (((Get-Date) - $lostSince).TotalSeconds -ge $LossGraceSeconds) {
             Write-Log 'Re-establishing genlock' Warn
-            [void](Invoke-LockLoop -CheckExisting $false -Max 0)
+            $result = Invoke-LockLoop -CheckExisting $false -Max 0
+            while ($result -ne 'Locked') {
+                Wait-RatesMatch
+                $result = Invoke-LockLoop -CheckExisting $true -Max 0
+            }
             $lostSince = $null
         }
     }
