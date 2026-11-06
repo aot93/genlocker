@@ -38,8 +38,10 @@ with `-ExecutionPolicy Bypass`.
 
 Failed attempts are retried with a growing back-off of 2 s, 4 s and so on, up to 10 s. Before each
 attempt, Genlocker compares the house sync rate with each display's refresh rate as Windows
-reports it. If they differ, retrying can't help, so it reports a **rate mismatch** and stops
-with exit code 4. In Watch mode it waits until the rates match, then carries on. The settle
+reports it. If they clearly differ, retrying can't help, so it reports a **rate mismatch** and
+stops with exit code 4. A **near miss** (within `-RateTolerance`, 0.08% by default) gets one real
+attempt first, because the Sync card can pull display timing slightly. If that attempt fails,
+Genlocker stops in the same way. In Watch mode it waits until the rates match, then carries on. The settle
 time after releasing the group also grows on each attempt. If the card is already locked when
 Genlocker starts, it only confirms the hold and changes nothing. Pass `-Force` to reconfigure
 anyway.
@@ -57,6 +59,7 @@ anyway.
 | `-ExcludeDisplayId` | none | Displays to leave out of the group, such as a GUI monitor |
 | `-Force` | off | Reconfigure even if the card is already locked |
 | `-LossGraceSeconds` | 2 | Watch mode: how long a lost lock is tolerated before Genlocker re-locks |
+| `-RateTolerance` | 0.08 | Largest rate difference, in percent, treated as a near miss and given one attempt |
 | `-IgnoreRateMismatch` | off | Keep retrying even when the rates don't match |
 | `-LogFile` | none | Also append the log to this file |
 
@@ -78,7 +81,13 @@ schtasks /Create /TN Genlocker /RL HIGHEST /SC ONLOGON /DELAY 0000:30 ^
 - **The rates must match.** The display timing has to match the house reference, for example 50 Hz
   output for a 50 Hz / 625i reference or 59.94 Hz for NTSC. Otherwise no amount of retrying will
   hold a lock. Genlocker shows the house sync rate and each display's refresh rate. When they
-  differ, it stops straight away with a `RATE MISMATCH` error (exit code 4) instead of retrying.
+  clearly differ, it stops straight away with a `RATE MISMATCH` error (exit code 4) instead of
+  retrying. Small differences are a near miss. A timing that works out to 49.971 Hz against a 50 Hz
+  SPG (0.06%) is typical: it comes from a pixel clock that doesn't divide evenly. A near miss gets
+  one attempt, then stops with `RATE NEAR MISS`. The fix is to set the output to exactly the
+  reference rate, using a standard CEA/SMPTE mode or a manual custom timing. NVIDIA doesn't
+  publish the card's pull range; if you find what your hardware tolerates, set `-RateTolerance`
+  to match.
   Display rates come from Windows, because the Sync card reports its own refresh as 0 until it
   locks. Windows reports them exactly, so 59.94 against 60 is caught. Interlaced modes match at
   either the field or the frame rate. If the check ever gets it wrong, `-IgnoreRateMismatch`

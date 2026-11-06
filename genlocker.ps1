@@ -68,6 +68,12 @@ param(
     # Keep retrying even when house sync and display refresh rates don't match.
     [switch]$IgnoreRateMismatch,
 
+    # Rate mismatches up to this many percent are near misses: one real attempt is made before
+    # stopping, because the Sync card can pull display timing slightly. Larger ones stop at once.
+    # The default puts 49.97 vs 50 Hz (0.06%) in, and 59.94 vs 60 Hz (0.1%) out.
+    [ValidateRange(0, 5)]
+    [double]$RateTolerance = 0.08,
+
     [string]$LogFile
 )
 
@@ -831,22 +837,46 @@ function Get-RateMismatch($Device) {
             $tolerance = [Math]::Max([Math]::Max($house.Resolution, $o.Resolution), 0.02)
             # Interlaced modes may be reported as frame or field rate.
             $candidates = if ($o.Interlaced) { @($o.Hz, ($o.Hz * 2), ($o.Hz / 2)) } else { @($o.Hz) }
-            if (-not ($candidates | Where-Object { [Math]::Abs($house.Hz - $_) -lt $tolerance })) { $o }
+            $diff = ($candidates | ForEach-Object { [Math]::Abs($house.Hz - $_) } | Measure-Object -Minimum).Minimum
+            if ($diff -ge $tolerance) {
+                $o | Add-Member -NotePropertyName OffPercent -NotePropertyValue (100 * $diff / $house.Hz) -PassThru
+            }
         })
     if ($bad.Count -eq 0) { return $null }
-    $desc = ($bad | ForEach-Object { '{0} runs at {1:0.###} Hz' -f $_.Name, $_.Hz }) -join ', '
-    "house sync on BNC is $houseText but $desc"
+    $desc = ($bad | ForEach-Object { '{0} runs at {1:0.###} Hz ({2:0.###}% off)' -f $_.Name, $_.Hz, $_.OffPercent }) -join ', '
+    [pscustomobject]@{
+        Text     = "house sync on BNC is $houseText but $desc"
+        # Close enough that the card may be able to pull the display timing onto the reference.
+        NearMiss = -not ($bad | Where-Object { $_.OffPercent -gt $RateTolerance })
+        TargetHz = Get-NominalRate $house.Hz
+    }
+}
+
+# The measured reference wobbles slightly (an SPG at 50 Hz reads 50.001); name the standard rate it is.
+function Get-NominalRate([double]$Hz) {
+    $standard = 23.976, 24, 25, 29.97, 30, 47.952, 48, 50, 59.94, 60, 72, 75, 90, 100, 119.88, 120
+    $nearest = $standard | Sort-Object { [Math]::Abs($_ - $Hz) } | Select-Object -First 1
+    if ([Math]::Abs($nearest - $Hz) / $Hz -lt 0.0002) { return $nearest }
+    return $Hz
 }
 
 function Get-HouseSyncDevice($Snapshot) {
     $Snapshot | Where-Object { $_.Status.HouseSync } | Select-Object -First 1
 }
 
-function Write-RateMismatchHelp([string]$Mismatch) {
-    Write-Log "RATE MISMATCH: $Mismatch." Error
-    Write-Log 'The Sync card cannot lock until the display refresh rate matches the house sync reference.' Error
-    Write-Log 'Set the output timing to the reference rate (e.g. 50 Hz for a 625/50 reference, 59.94 Hz for 525/59.94),' Error
-    Write-Log 'or change the reference to the output rate, then run Genlocker again.' Error
+function Write-RateMismatchHelp($Mismatch) {
+    if ($Mismatch.NearMiss) {
+        Write-Log "RATE NEAR MISS: $($Mismatch.Text)." Error
+        Write-Log 'The display timing is close to the reference, but too far off for the Sync card to pull it into lock.' Error
+        Write-Log "Set the output timing to exactly $($Mismatch.TargetHz) Hz - use a standard CEA/SMPTE mode, or a custom" Error
+        Write-Log 'resolution with Timing: Manual and adjust the pixel clock / totals - then run Genlocker again.' Error
+    }
+    else {
+        Write-Log "RATE MISMATCH: $($Mismatch.Text)." Error
+        Write-Log 'The Sync card cannot lock until the display refresh rate matches the house sync reference.' Error
+        Write-Log "Set the output timing to $($Mismatch.TargetHz) Hz to match the reference, or change the reference" Error
+        Write-Log 'to the output rate, then run Genlocker again.' Error
+    }
 }
 
 # Watch mode: after a mismatch, wait for someone to fix the rates rather than hammering re-lock attempts.
@@ -914,7 +944,7 @@ function Invoke-LockAttempt([int]$Attempt) {
     Write-Log "Server display $(Format-DisplayId $master.Display.DisplayId) on Sync device $($mdev.Index); $($plan.Active.Count - 1) client display(s)"
     if (-not $mdev.Status.HouseSync) { Write-Log "Sync device $($mdev.Index) has no house sync signal but the server display is on it" Warn }
     $mismatch = Get-RateMismatch $mdev
-    if ($mismatch) { Write-Log "Rate mismatch: $mismatch - trying anyway" Warn }
+    if ($mismatch -and $IgnoreRateMismatch) { Write-Log "Rate mismatch ignored: $($mismatch.Text)" Warn }
 
     # Each retry gives the hardware a little longer to settle.
     $settleMs = [Math]::Min(1000 + 500 * ($Attempt - 1), 5000)
@@ -957,20 +987,29 @@ function Invoke-LockLoop([bool]$CheckExisting, [int]$Max) {
             Write-Log "Not locked: $($t.Reason)"
         }
     }
+    $nearMissTried = $false
     for ($n = 1; $Max -le 0 -or $n -le $Max; $n++) {
         # No amount of retrying locks a mismatched rate, so stop before trying.
+        # A near miss gets one real attempt first, since the card can pull timing a little.
+        $mismatch = $null
         if (-not $IgnoreRateMismatch) {
-            $mismatch = $null
             try { $mismatch = Get-RateMismatch (Get-HouseSyncDevice (Get-SyncSnapshot)) } catch { }
-            if ($mismatch) {
+            if ($mismatch -and (-not $mismatch.NearMiss -or $nearMissTried)) {
                 Write-RateMismatchHelp $mismatch
                 return 'RateMismatch'
+            }
+            if ($mismatch) {
+                Write-Log "Near miss: $($mismatch.Text) - within ${RateTolerance}%, trying once" Warn
+                $nearMissTried = $true
             }
         }
         Write-Log ('--- Attempt {0}{1} ---' -f $n, $(if ($Max -gt 0) { " of $Max" } else { '' }))
         try {
             if (Invoke-LockAttempt $n) {
                 Write-Log "GENLOCKED: lock to house sync held for ${HoldSeconds}s (attempt $n)" Good
+                if ($nearMissTried) {
+                    Write-Log "The card is pulling an off-reference display timing; set exactly $($mismatch.TargetHz) Hz for more margin" Warn
+                }
                 return 'Locked'
             }
         }
@@ -1032,7 +1071,12 @@ switch ($Action) {
         if ($t.Locked) { Write-Log 'LOCKED to house sync' Good; exit 0 }
         Write-Log "NOT locked: $($t.Reason)" Warn
         $mismatch = Get-RateMismatch (Get-HouseSyncDevice $snap)
-        if ($mismatch) { Write-RateMismatchHelp $mismatch }
+        if ($mismatch -and $mismatch.NearMiss) {
+            Write-Log "Near miss: $($mismatch.Text) - the card may still pull it into lock; exactly $($mismatch.TargetHz) Hz is safer" Warn
+        }
+        elseif ($mismatch) {
+            Write-RateMismatchHelp $mismatch
+        }
         exit 1
     }
     'Unlock' {
