@@ -690,7 +690,9 @@ function Write-SyncStatus($Snapshot) {
         Write-Log ('  Sync source: {0} | signal type: {1} | polarity: {2} | interval: {3}{4}' -f `
             $(if ($c.Source -eq 1) { 'HOUSE SYNC' } else { 'VSync (internal/display)' }),
             $VideoModeNames[$c.VideoMode], $PolarityNames[$c.Polarity], $c.Interval,
-            $(if ($c.MultiplyDivideMode -ne 0) { " | mul/div mode $($c.MultiplyDivideMode) x$($c.MultiplyDivideValue)" } else { '' }))
+            $(if ($c.MultiplyDivideValue -gt 1 -and $c.MultiplyDivideMode -in @(1, 2)) {
+                    ' | house sync {0}{1}' -f $(if ($c.MultiplyDivideMode -eq 1) { 'x' } else { '/' }), $c.MultiplyDivideValue
+                } else { '' }))
         foreach ($g in $dev.Gpus) {
             $level = if ($g.Status.Synced) { 'Good' } else { 'Warn' }
             Write-Log ('  GPU "{0}" ({1} connector): synced={2} signal={3}' -f $g.Info.Name, $ConnectorNames[$g.Info.Connector], `
@@ -791,11 +793,22 @@ function Get-DisplayRefreshMap {
 }
 
 # Returns a description of the mismatch, or $null when the rates match or can't be compared
-# (no signal, rate unknown, or the card is multiplying/dividing house sync).
+# (no signal or rate unknown).
 function Get-RateMismatch($Device) {
-    if (-not $Device -or -not $Device.Status.HouseSync -or $Device.Control.MultiplyDivideMode -ne 0) { return $null }
+    if (-not $Device -or -not $Device.Status.HouseSync) { return $null }
     $house = Get-Rate $Device.Status.HouseSyncIncoming
     if ($house.Hz -le 0) { return $null }
+    $houseText = "$($house.Hz) Hz"
+
+    # The driver reports mode 1 with a value of 0 when multiply/divide isn't in use, so only a value above 1 counts.
+    $factor = $Device.Control.MultiplyDivideValue
+    if ($factor -gt 1 -and $Device.Control.MultiplyDivideMode -in @(1, 2)) {
+        $op = if ($Device.Control.MultiplyDivideMode -eq 1) { 'x' } else { '/' }
+        $scaled = if ($op -eq 'x') { $house.Hz * $factor } else { $house.Hz / $factor }
+        $resolution = if ($op -eq 'x') { $house.Resolution * $factor } else { $house.Resolution / $factor }
+        $house = [pscustomobject]@{ Hz = [Math]::Round($scaled, 3); Resolution = $resolution }
+        $houseText += " $op$factor = $($house.Hz) Hz"
+    }
 
     # Prefer the exact per-display rates from Windows; the card's own figure is 0 until it locks.
     $outputs = New-Object System.Collections.Generic.List[object]
@@ -822,7 +835,7 @@ function Get-RateMismatch($Device) {
         })
     if ($bad.Count -eq 0) { return $null }
     $desc = ($bad | ForEach-Object { '{0} runs at {1:0.###} Hz' -f $_.Name, $_.Hz }) -join ', '
-    "house sync on BNC is $($house.Hz) Hz but $desc"
+    "house sync on BNC is $houseText but $desc"
 }
 
 function Get-HouseSyncDevice($Snapshot) {
